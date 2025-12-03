@@ -234,6 +234,7 @@ export default function TheCircleApp() {
   const navigate = useNavigate();
   const { scrollY } = useScroll();
   const rotation = useMotionValue(0);
+  const [hasLoaded, setHasLoaded] = useState(false);
   
   // Scroll-based animations
   const scrollVelocity = useVelocity(scrollY);
@@ -243,6 +244,11 @@ export default function TheCircleApp() {
   // Scale down on scroll
   const scale = useTransform(scrollY, [0, 500], [1, 0.7]);
   const circleScale = useSpring(scale, { damping: 30, stiffness: 300 });
+  
+  // Initial load animation
+  useEffect(() => {
+    setHasLoaded(true);
+  }, []);
   
   // Rotation with scroll influence - 40% faster base speed + scroll boost
   useEffect(() => {
@@ -303,13 +309,23 @@ export default function TheCircleApp() {
 
         {/* Hero Section */}
         <section className="relative h-screen flex flex-col items-center justify-center overflow-hidden perspective-1000">
-            {/* Spinning Circle */}
+            {/* Spinning Circle - Reduced 20% in responsive */}
             <motion.div 
+                initial={{ scale: 0.3, opacity: 0 }}
+                animate={{ 
+                  scale: hasLoaded ? 1 : 0.3,
+                  opacity: hasLoaded ? 1 : 0
+                }}
+                transition={{ 
+                  duration: 1.2, 
+                  ease: [0.34, 1.56, 0.64, 1],
+                  delay: 0.2
+                }}
                 style={{ 
                   rotate: rotation,
                   scale: circleScale
                 }}
-                className="absolute w-[180vw] h-[180vw] md:w-[90vh] md:h-[90vh] flex items-center justify-center"
+                className="absolute w-[144vw] h-[144vw] md:w-[90vh] md:h-[90vh] flex items-center justify-center"
             >
                 <svg viewBox="0 0 300 300" className="w-full h-full" style={{ fontFamily: 'Poppins, sans-serif' }}>
                   <defs>
