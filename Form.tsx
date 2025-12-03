@@ -1,26 +1,219 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
-import { ArrowLeft, Send } from 'lucide-react';
+import { ArrowLeft, Send, Radio } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+
+// --- WEBGL BACKGROUND (Same as main page) ---
+const vertexShaderSource = `
+  attribute vec2 position;
+  varying vec2 vUv;
+  void main() {
+    vUv = position * 0.5 + 0.5;
+    gl_Position = vec4(position, 0.0, 1.0);
+  }
+`;
+
+const fragmentShaderSource = `
+  precision mediump float;
+  uniform float uTime;
+  uniform vec2 uMouse;
+  uniform vec2 uResolution;
+  uniform float uChaos;
+  varying vec2 vUv;
+
+  float random(vec2 st) {
+      return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+  }
+
+  float noise(vec2 st) {
+      vec2 i = floor(st);
+      vec2 f = fract(st);
+      float a = random(i);
+      float b = random(i + vec2(1.0, 0.0));
+      float c = random(i + vec2(0.0, 1.0));
+      float d = random(i + vec2(1.0, 1.0));
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      return mix(a, b, u.x) + (c - a)* u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+  }
+
+  void main() {
+    vec2 st = vUv;
+    float aspect = uResolution.x / uResolution.y;
+    st.x *= aspect;
+    
+    vec2 mouse = uMouse;
+    mouse.x *= aspect;
+
+    float dist = distance(st, mouse);
+    float decay = clamp(1.0 - dist * 2.5, 0.0, 1.0);
+    float ripple = sin(dist * 30.0 - uTime * 3.0) * 0.02 * decay;
+    
+    vec2 center = vec2(0.5 * aspect, 0.5);
+    vec2 toCenter = center - st;
+    float distToCenter = length(toCenter);
+    
+    vec2 suction = normalize(toCenter) * uChaos * 0.1 * sin(uTime * 10.0);
+    float chaosNoise = (random(st * uTime) - 0.5) * uChaos * 0.1;
+    
+    vec2 distortedSt = vUv + ripple + suction + chaosNoise;
+    
+    float gridSize = 30.0;
+    vec2 gridUV = distortedSt * gridSize;
+    
+    float thickness = 0.03 + (uChaos * 0.05);
+    vec2 gridLine = smoothstep(0.5 - thickness, 0.5, fract(gridUV)) * smoothstep(0.5 + thickness, 0.5, fract(gridUV));
+    float lines = max(gridLine.x, gridLine.y);
+    
+    float vignette = smoothstep(0.8, 0.2, distance(vUv, vec2(0.5)));
+    
+    vec3 black = vec3(0.05, 0.0, 0.02);
+    vec3 red = vec3(0.77, 0.13, 0.13);
+    
+    float fog = noise(distortedSt * 3.0 + uTime * 0.2);
+    vec3 color = mix(black, red * 0.3, fog);
+    
+    float gridIntensity = 0.05 + (uChaos * 0.8); 
+    color = mix(color, red, lines * gridIntensity * vignette);
+
+    if (uChaos > 0.0) {
+        color *= smoothstep(0.0, 0.5, distToCenter + (1.0 - uChaos));
+    }
+
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+const WebGLBackground: React.FC<{ chaosLevel: number }> = ({ chaosLevel }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const gl = canvas.getContext('webgl');
+    if (!gl) return;
+
+    const createShader = (gl: WebGLRenderingContext, type: number, source: string) => {
+      const shader = gl.createShader(type);
+      if (!shader) return null;
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    };
+
+    const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+    const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+    if (!vertexShader || !fragmentShader) return;
+
+    const program = gl.createProgram();
+    if (!program) return;
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error(gl.getProgramInfoLog(program));
+      return;
+    }
+
+    gl.useProgram(program);
+
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+
+    const positionLocation = gl.getAttribLocation(program, 'position');
+    gl.enableVertexAttribArray(positionLocation);
+    gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+    const uTimeLoc = gl.getUniformLocation(program, 'uTime');
+    const uMouseLoc = gl.getUniformLocation(program, 'uMouse');
+    const uResolutionLoc = gl.getUniformLocation(program, 'uResolution');
+    const uChaosLoc = gl.getUniformLocation(program, 'uChaos');
+
+    let mouse = { x: 0.5, y: 0.5 };
+    let targetMouse = { x: 0.5, y: 0.5 };
+    let startTime = performance.now();
+    let animationId: number;
+
+    const handleResize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.uniform2f(uResolutionLoc, canvas.width, canvas.height);
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      targetMouse.x = e.clientX;
+      targetMouse.y = window.innerHeight - e.clientY;
+    };
+
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('mousemove', handleMouseMove);
+    handleResize();
+
+    const render = () => {
+      const time = (performance.now() - startTime) * 0.001;
+      mouse.x += (targetMouse.x - mouse.x) * 0.1;
+      mouse.y += (targetMouse.y - mouse.y) * 0.1;
+      gl.uniform1f(uTimeLoc, time);
+      gl.uniform2f(uMouseLoc, mouse.x, mouse.y);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      animationId = requestAnimationFrame(render);
+    };
+    render();
+
+    (canvas as any).updateChaos = (val: number) => {
+      gl.useProgram(program);
+      gl.uniform1f(uChaosLoc, val);
+    };
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('mousemove', handleMouseMove);
+      cancelAnimationFrame(animationId);
+      gl.deleteProgram(program);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (canvasRef.current && (canvasRef.current as any).updateChaos) {
+      (canvasRef.current as any).updateChaos(chaosLevel);
+    }
+  }, [chaosLevel]);
+
+  return <canvas ref={canvasRef} className="fixed top-0 left-0 w-full h-full z-0 pointer-events-none" />;
+};
 
 export default function FormPage() {
   const navigate = useNavigate();
+  const [chaosLevel, setChaosLevel] = useState(0);
   const [formData, setFormData] = useState({
-    name: '',
-    email: '',
-    phone: '',
-    instagram: ''
+    fullName: '',
+    ageLocation: '',
+    instagram: '',
+    unexpected: '',
+    dreamGuest: '',
+    expectations: ''
   });
   const [submitted, setSubmitted] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    // Aquí puedes agregar la lógica para enviar el formulario
-    console.log('Form submitted:', formData);
-    setSubmitted(true);
+    setChaosLevel(0.3); // Subtle chaos effect on submit
+    
+    setTimeout(() => {
+      console.log('Form submitted:', formData);
+      setSubmitted(true);
+      setChaosLevel(0);
+    }, 500);
   };
 
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
     setFormData({
       ...formData,
       [e.target.name]: e.target.value
@@ -29,96 +222,87 @@ export default function FormPage() {
 
   if (submitted) {
     return (
-      <div className="min-h-screen bg-[#050000] text-[#C42121] flex items-center justify-center p-6 relative overflow-hidden">
-        {/* Background Pattern */}
-        <div className="fixed inset-0 opacity-[0.02]" 
-             style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E")` }}>
-        </div>
+      <div className="min-h-screen bg-[#050000] text-[#C42121] flex items-center justify-center p-6 relative overflow-hidden cursor-crosshair">
+        <WebGLBackground chaosLevel={0} />
         
         <motion.div
           initial={{ opacity: 0, scale: 0.9 }}
           animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.6, ease: "easeOut" }}
+          transition={{ duration: 1.5, ease: "easeOut" }}
           className="text-center max-w-3xl relative z-10"
         >
-          {/* Animated Circle */}
           <motion.div 
-            initial={{ scale: 0, rotate: -180 }}
-            animate={{ scale: 1, rotate: 0 }}
-            transition={{ duration: 0.8, delay: 0.2, type: "spring" }}
-            className="relative mx-auto mb-12"
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            transition={{ duration: 0.8, delay: 0.3, type: "spring", bounce: 0.4 }}
+            className="mb-12"
           >
             <div className="w-32 h-32 border-2 border-[#C42121] rounded-full mx-auto flex items-center justify-center relative">
               <motion.div 
-                animate={{ scale: [1, 1.2, 1] }}
+                animate={{ scale: [1, 1.3, 1] }}
                 transition={{ repeat: Infinity, duration: 2 }}
-                className="w-4 h-4 bg-[#C42121] rounded-full shadow-[0_0_20px_#C42121]" 
+                className="w-4 h-4 bg-[#C42121] rounded-full shadow-[0_0_30px_#C42121]" 
               />
               <motion.div
                 animate={{ rotate: 360 }}
-                transition={{ repeat: Infinity, duration: 3, ease: "linear" }}
+                transition={{ repeat: Infinity, duration: 4, ease: "linear" }}
                 className="absolute inset-0 border-t-2 border-[#C42121] rounded-full"
               />
             </div>
           </motion.div>
 
-          {/* Title */}
           <motion.h2 
-            initial={{ opacity: 0, y: 20 }}
+            initial={{ opacity: 0, y: 30 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.4 }}
-            className="text-6xl md:text-8xl font-black mb-8 tracking-tighter leading-[0.9]"
+            transition={{ delay: 0.5 }}
+            className="text-5xl md:text-8xl font-black mb-6 tracking-tighter leading-[0.85] mix-blend-exclusion"
           >
-            ACCESS<br/>REQUESTED
+            SIGNAL<br/>RECEIVED
           </motion.h2>
 
-          {/* Divider */}
           <motion.div 
             initial={{ scaleX: 0 }}
             animate={{ scaleX: 1 }}
-            transition={{ delay: 0.6, duration: 0.6 }}
-            className="w-48 h-[2px] bg-[#C42121] mx-auto mb-8"
+            transition={{ delay: 0.7, duration: 0.8 }}
+            className="w-64 h-[1px] bg-[#C42121] mx-auto mb-8"
           />
 
-          {/* Message */}
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            transition={{ delay: 0.8 }}
-            className="space-y-4 mb-12"
+            transition={{ delay: 0.9 }}
+            className="space-y-3 mb-10"
           >
-            <p className="text-xl font-light opacity-90">
-              Your request has been received.
+            <p className="text-lg font-mono tracking-[0.3em] uppercase opacity-80">
+              Your data has been encrypted
             </p>
-            <p className="text-sm tracking-[0.3em] opacity-60 uppercase">
-              We will contact you if you are selected
+            <p className="text-sm tracking-[0.2em] opacity-50 uppercase font-mono">
+              We will contact you if selected
             </p>
           </motion.div>
 
-          {/* Info Box */}
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 1 }}
-            className="p-8 border border-[#C42121]/30 bg-[#C42121]/5 mb-12 backdrop-blur-sm"
+            transition={{ delay: 1.1 }}
+            className="p-6 border border-[#C42121]/20 bg-black/60 backdrop-blur-sm mb-10"
           >
-            <p className="text-xs leading-relaxed opacity-70">
-              Check your email in the next 48 hours.<br/>
-              Remember: Discretion is mandatory.
+            <p className="text-xs font-mono leading-relaxed opacity-60 tracking-wider">
+              PROTOCOL INITIATED / AWAIT FURTHER INSTRUCTIONS<br/>
+              DO NOT SHARE THIS CONFIRMATION
             </p>
           </motion.div>
 
-          {/* Return Button */}
           <motion.button
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            transition={{ delay: 1.2 }}
+            transition={{ delay: 1.3 }}
             onClick={() => navigate('/')}
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-            className="border-2 border-[#C42121] px-12 py-4 text-sm tracking-widest hover:bg-[#C42121] hover:text-black transition-all uppercase font-bold"
+            whileHover={{ scale: 1.03, backgroundColor: '#C42121' }}
+            whileTap={{ scale: 0.97 }}
+            className="border border-[#C42121] px-10 py-3 text-xs tracking-[0.3em] transition-colors uppercase font-bold mix-blend-exclusion"
           >
-            RETURN TO MAIN
+            RETURN
           </motion.button>
         </motion.div>
       </div>
@@ -126,154 +310,257 @@ export default function FormPage() {
   }
 
   return (
-    <div className="min-h-screen bg-[#050000] text-[#C42121] selection:bg-[#C42121] selection:text-black">
-      {/* Background Pattern */}
-      <div className="fixed inset-0 opacity-[0.03]" 
-           style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E")` }}>
-      </div>
+    <div className="min-h-screen bg-[#050000] text-[#C42121] selection:bg-[#C42121] selection:text-black cursor-crosshair overflow-x-hidden">
+      <WebGLBackground chaosLevel={chaosLevel} />
 
-      {/* Header */}
-      <nav className="fixed top-0 w-full p-6 md:p-10 z-50">
+      {/* Navigation */}
+      <nav className="fixed top-0 w-full p-6 flex justify-between items-center z-50 mix-blend-difference">
         <button
           onClick={() => navigate('/')}
-          className="flex items-center gap-2 text-xs tracking-widest hover:opacity-70 transition-opacity uppercase"
+          className="flex items-center gap-2 text-xs font-mono tracking-widest hover:opacity-70 transition-opacity uppercase"
         >
           <ArrowLeft className="w-4 h-4" />
           BACK
         </button>
+        <div className="flex items-center gap-2">
+          <Radio className="animate-pulse w-3 h-3" />
+          <span className="text-[10px] font-mono tracking-widest">ENCRYPTED CONNECTION</span>
+        </div>
       </nav>
 
       {/* Form Container */}
-      <div className="relative z-10 min-h-screen flex items-center justify-center p-6 py-24">
+      <div className="relative z-10 min-h-screen flex items-center justify-center p-6 py-32">
         <motion.div
-          initial={{ opacity: 0, y: 20 }}
+          initial={{ opacity: 0, y: 30 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.6 }}
-          className="w-full max-w-2xl"
+          transition={{ duration: 0.8, ease: "easeOut" }}
+          className="w-full max-w-4xl"
         >
           {/* Title Section */}
           <div className="text-center mb-16">
-            <div className="w-3 h-3 bg-[#C42121] rounded-full mx-auto mb-8 animate-pulse shadow-[0_0_20px_#C42121]" />
-            <h1 className="text-6xl md:text-8xl font-black mb-4 tracking-tighter leading-[0.85]">
-              JOIN<br/>US
+            <motion.div 
+              animate={{ scale: [1, 1.2, 1] }}
+              transition={{ repeat: Infinity, duration: 3 }}
+              className="w-2 h-2 bg-[#C42121] rounded-full mx-auto mb-10 shadow-[0_0_30px_#C42121]" 
+            />
+            <h1 className="text-6xl md:text-9xl font-black mb-6 tracking-tighter leading-[0.8] mix-blend-exclusion">
+              JOIN<br/>THE CIRCLE
             </h1>
-            <div className="w-32 h-[2px] bg-[#C42121] mx-auto my-6" />
-            <p className="text-sm tracking-[0.4em] opacity-50 uppercase">
-              Exclusive Access • Limited Capacity
+            <div className="w-48 h-[1px] bg-[#C42121] mx-auto my-8 opacity-50" />
+            <p className="text-xs font-mono tracking-[0.5em] opacity-40 uppercase">
+              Vol. II • Access Request
             </p>
           </div>
 
-          {/* Info Text */}
-          <div className="mb-12 p-6 border border-[#C42121]/20 bg-[#C42121]/5">
-            <p className="text-xs leading-relaxed opacity-70 text-center">
-              By joining THECIRCLE, you agree to maintain absolute discretion.
-              <br/>
-              No photos. No guests. Total silence.
+          {/* Protocol Box */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.3 }}
+            className="mb-12 p-8 border border-[#C42121]/20 bg-black/60 backdrop-blur-sm"
+          >
+            <p className="text-[10px] font-mono leading-relaxed opacity-60 text-center tracking-widest uppercase">
+              Protocol: No Photos • No Guests • Total Silence<br/>
+              Capacity: 0.1% • Discretion Mandatory
             </p>
-          </div>
+          </motion.div>
 
           {/* Form */}
-          <form onSubmit={handleSubmit} className="space-y-8">
-            {/* Name Field */}
-            <div className="relative group">
-              <label className="block text-xs tracking-widest mb-2 opacity-60 uppercase">
-                Full Name *
+          <form onSubmit={handleSubmit} className="space-y-12">
+            {/* Full Name */}
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.4 }}
+              className="group"
+            >
+              <label className="block text-[10px] font-mono tracking-[0.3em] mb-3 opacity-50 uppercase">
+                Full Name
               </label>
               <input
                 type="text"
-                name="name"
+                name="fullName"
                 required
-                value={formData.name}
+                value={formData.fullName}
                 onChange={handleChange}
-                className="w-full bg-transparent border-b-2 border-[#333] py-4 text-[#C42121] text-xl focus:outline-none focus:border-[#C42121] transition-all"
-                placeholder="John Doe"
+                className="w-full bg-transparent border-b border-[#333] py-4 text-[#C42121] text-lg font-mono focus:outline-none focus:border-[#C42121] transition-all placeholder:text-[#333] placeholder:text-sm"
+                placeholder="Your complete name"
               />
-            </div>
+            </motion.div>
 
-            {/* Email Field */}
-            <div className="relative group">
-              <label className="block text-xs tracking-widest mb-2 opacity-60 uppercase">
-                Email *
+            {/* Age & Location */}
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.5 }}
+              className="group"
+            >
+              <label className="block text-[10px] font-mono tracking-[0.3em] mb-3 opacity-50 uppercase">
+                Your age & where are you from?
               </label>
               <input
-                type="email"
-                name="email"
+                type="text"
+                name="ageLocation"
                 required
-                value={formData.email}
+                value={formData.ageLocation}
                 onChange={handleChange}
-                className="w-full bg-transparent border-b-2 border-[#333] py-4 text-[#C42121] text-xl focus:outline-none focus:border-[#C42121] transition-all"
-                placeholder="john@example.com"
+                className="w-full bg-transparent border-b border-[#333] py-4 text-[#C42121] text-lg font-mono focus:outline-none focus:border-[#C42121] transition-all placeholder:text-[#333] placeholder:text-sm"
+                placeholder="e.g., 28, Valencia"
               />
-            </div>
+            </motion.div>
 
-            {/* Phone Field */}
-            <div className="relative group">
-              <label className="block text-xs tracking-widest mb-2 opacity-60 uppercase">
-                Phone
-              </label>
-              <input
-                type="tel"
-                name="phone"
-                value={formData.phone}
-                onChange={handleChange}
-                className="w-full bg-transparent border-b-2 border-[#333] py-4 text-[#C42121] text-xl focus:outline-none focus:border-[#C42121] transition-all"
-                placeholder="+34 123 456 789"
-              />
-            </div>
-
-            {/* Instagram Field */}
-            <div className="relative group">
-              <label className="block text-xs tracking-widest mb-2 opacity-60 uppercase">
-                Instagram
+            {/* Instagram */}
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.6 }}
+              className="group"
+            >
+              <label className="block text-[10px] font-mono tracking-[0.3em] mb-3 opacity-50 uppercase">
+                Your Instagram Account
               </label>
               <input
                 type="text"
                 name="instagram"
+                required
                 value={formData.instagram}
                 onChange={handleChange}
-                className="w-full bg-transparent border-b-2 border-[#333] py-4 text-[#C42121] text-xl focus:outline-none focus:border-[#C42121] transition-all"
+                className="w-full bg-transparent border-b border-[#333] py-4 text-[#C42121] text-lg font-mono focus:outline-none focus:border-[#C42121] transition-all placeholder:text-[#333] placeholder:text-sm"
                 placeholder="@username"
               />
-            </div>
+            </motion.div>
 
-            {/* Submit Button */}
-            <div className="flex justify-center pt-8">
-              <motion.button
+            {/* Unexpected */}
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.7 }}
+              className="group"
+            >
+              <label className="block text-[10px] font-mono tracking-[0.3em] mb-3 opacity-50 uppercase">
+                What's something people would never expect about you?
+              </label>
+              <textarea
+                name="unexpected"
+                required
+                value={formData.unexpected}
+                onChange={handleChange}
+                rows={3}
+                className="w-full bg-transparent border-b border-[#333] py-4 text-[#C42121] text-lg font-mono focus:outline-none focus:border-[#C42121] transition-all placeholder:text-[#333] placeholder:text-sm resize-none"
+                placeholder="Your answer"
+              />
+            </motion.div>
+
+            {/* Dream Guest */}
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.8 }}
+              className="group"
+            >
+              <label className="block text-[10px] font-mono tracking-[0.3em] mb-3 opacity-50 uppercase">
+                Imagine The Circle could bring anyone to the table, who would you want to sit with?
+              </label>
+              <textarea
+                name="dreamGuest"
+                required
+                value={formData.dreamGuest}
+                onChange={handleChange}
+                rows={3}
+                className="w-full bg-transparent border-b border-[#333] py-4 text-[#C42121] text-lg font-mono focus:outline-none focus:border-[#C42121] transition-all placeholder:text-[#333] placeholder:text-sm resize-none"
+                placeholder="Your answer"
+              />
+            </motion.div>
+
+            {/* Expectations */}
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.9 }}
+              className="group"
+            >
+              <label className="block text-[10px] font-mono tracking-[0.3em] mb-3 opacity-50 uppercase">
+                What do you expect from The Circle?
+              </label>
+              <textarea
+                name="expectations"
+                required
+                value={formData.expectations}
+                onChange={handleChange}
+                rows={3}
+                className="w-full bg-transparent border-b border-[#333] py-4 text-[#C42121] text-lg font-mono focus:outline-none focus:border-[#C42121] transition-all placeholder:text-[#333] placeholder:text-sm resize-none"
+                placeholder="Your answer"
+              />
+            </motion.div>
+
+            {/* Submit Button with Gradient Animation */}
+            <motion.div 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 1 }}
+              className="flex justify-center pt-12"
+            >
+              <button
                 type="submit"
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-                className="group relative bg-[#C42121] text-black font-black text-xl py-6 px-20 uppercase tracking-widest hover:bg-[#ff3333] transition-all overflow-hidden shadow-[0_0_30px_rgba(196,33,33,0.3)]"
+                className="group relative bg-[#C42121] text-black font-black text-lg py-5 px-16 uppercase tracking-[0.3em] overflow-hidden transition-all duration-500 hover:shadow-[0_0_50px_rgba(196,33,33,0.6)]"
               >
-                <span className="relative z-10 flex items-center gap-3">
-                  REQUEST ACCESS
-                  <Send className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+                <span className="relative z-10 flex items-center gap-3 mix-blend-difference">
+                  SUBMIT REQUEST
+                  <Send className="w-5 h-5 group-hover:translate-x-2 transition-transform duration-300" />
                 </span>
-              </motion.button>
-            </div>
+                {/* Animated Gradient */}
+                <div className="absolute inset-0 bg-gradient-to-r from-[#C42121] via-[#ff3333] to-[#C42121] bg-[length:200%_100%] animate-gradient-x opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+              </button>
+            </motion.div>
           </form>
 
-          {/* Footer Note */}
-          <div className="mt-16 space-y-4">
-            <p className="text-center text-xs tracking-widest opacity-40 uppercase">
-              Your data will be kept confidential
+          {/* Footer */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 1.2 }}
+            className="mt-20 space-y-6"
+          >
+            <p className="text-center text-[9px] font-mono tracking-[0.4em] opacity-30 uppercase">
+              Encrypted • Confidential • Verified
             </p>
-            <div className="flex justify-center gap-8 text-[10px] tracking-widest opacity-30 uppercase">
+            <div className="flex justify-center gap-6 text-[8px] font-mono tracking-widest opacity-20 uppercase">
               <span>Valencia</span>
-              <span>•</span>
+              <span>/</span>
               <span>Vol. II</span>
-              <span>•</span>
+              <span>/</span>
               <span>2024</span>
             </div>
-          </div>
+          </motion.div>
         </motion.div>
       </div>
 
       {/* Footer */}
-      <footer className="fixed bottom-0 w-full p-6 flex justify-center z-40 opacity-50">
-        <div className="text-xs tracking-widest">
+      <footer className="fixed bottom-0 w-full p-6 flex justify-between items-end z-40 pointer-events-none mix-blend-difference opacity-40">
+        <div className="text-[9px] font-mono tracking-widest uppercase">
           © 2024 THECIRCLE
         </div>
+        <div className="text-[9px] font-mono tracking-widest uppercase">
+          <a href="mailto:contact@thecirclevlc.com" className="pointer-events-auto hover:opacity-100 transition-opacity">
+            contact@thecirclevlc.com
+          </a>
+        </div>
       </footer>
+
+      {/* Custom Styles */}
+      <style>{`
+        @keyframes gradient-x {
+          0%, 100% {
+            background-position: 0% 50%;
+          }
+          50% {
+            background-position: 100% 50%;
+          }
+        }
+        .animate-gradient-x {
+          animation: gradient-x 3s ease infinite;
+        }
+      `}</style>
     </div>
   );
 }
